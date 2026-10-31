@@ -87,21 +87,6 @@ python3 -m unittest discover -s tests -v
 
 Os testes validam as funcionalidades anteriores e cobrem movimento SSTF do exemplo, FCFS, SCAN, validação de trilhas, integração com leitura/gravação e reconstrução RAID 1/5 e impossibilidade de recuperar RAID 0.
 
-## Publicação no GitHub
-
-Para submeter o link, crie um repositório vazio no GitHub e, na pasta do projeto, execute:
-
-```bash
-git init
-git add .
-git commit -m "Implementa simulador de E/S e RAID"
-git branch -M main
-git remote add origin https://github.com/SEU-USUARIO/simulador-sistema-arquivos.git
-git push -u origin main
-```
-
-Troque `SEU-USUARIO` pelo seu nome de usuário e entregue o endereço do repositório. Não consigo publicar na sua conta sem acesso autorizado ao GitHub.
-
 ## Limitações didáticas
 
 É um simulador educacional em memória, não um sistema de arquivos real. Os números de trilha são obtidos do identificador de bloco módulo quantidade de trilhas; isso ilustra o algoritmo, mas não representa geometria física moderna. O estado RAID e a árvore do sistema de arquivos são simulações separadas; os blocos lógicos do sistema de arquivos não representam alocação real de blocos em hardware RAID.
