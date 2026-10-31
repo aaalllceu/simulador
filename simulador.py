@@ -9,6 +9,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
+from disk_io import DiskScheduler, IORequest, RAIDArray
+
 
 @dataclass
 class Node:
@@ -38,7 +40,9 @@ class FileSystem:
     STRATEGIES = ("contiguous", "linked", "indexed")
 
     def __init__(self, block_size: int = 4096, total_blocks: int = 16,
-                 strategy: str = "indexed"):
+                 strategy: str = "indexed", scheduler: str = "SSTF",
+                 disk_tracks: int = 200, head: int = 53,
+                 raid_level: str = "5", raid_disks: int = 3):
         if block_size <= 0 or total_blocks <= 0:
             raise ValueError("O tamanho do bloco e a quantidade de blocos devem ser positivos.")
         if strategy not in self.STRATEGIES:
@@ -46,8 +50,56 @@ class FileSystem:
         self.block_size = block_size
         self.total_blocks = total_blocks
         self.strategy = strategy
+        self.scheduler = DiskScheduler(scheduler, disk_tracks, head)
+        self.raid = RAIDArray(raid_level, raid_disks, block_size)
         self.root = Node("", True)
         self.cwd = self.root
+        self.io_log: list[str] = []
+
+    def _schedule_file_io(self, node: Node, operation: str) -> str:
+        requests = [IORequest(track=block % self.scheduler.tracks,
+                              operation=operation.upper(), path=node.path(), block=block)
+                    for block in node.blocks]
+        if node.index_block is not None:
+            requests.insert(0, IORequest(track=node.index_block % self.scheduler.tracks,
+                                         operation="METADATA", path=node.path(), block=node.index_block))
+        if not requests:
+            return "[E/S] Arquivo vazio: nenhuma operação de bloco necessária."
+        result = self.scheduler.schedule(requests)
+        self.io_log.append(result)
+        return result
+
+    def write_data(self, path: str, data: bytes) -> str:
+        node = self._resolve(path)
+        if node.is_dir:
+            raise FileSystemError(f"'{node.path()}' é um diretório, não um arquivo.")
+        required_size = max(node.size, len(data))
+        if required_size > node.size:
+            self.update_file(path, required_size)
+            node = self._resolve(path)
+        result = self._schedule_file_io(node, "WRITE")
+        raid_lines = self.raid.write(node.path(), data)
+        return result + "\n\n" + "\n".join(raid_lines)
+
+    def read_data(self, path: str) -> str:
+        node = self._resolve(path)
+        if node.is_dir:
+            raise FileSystemError(f"'{node.path()}' é um diretório, não um arquivo.")
+        result = self._schedule_file_io(node, "READ")
+        raid_details = self.raid.status()
+        return result + "\n\n[LEITURA RAID]\n" + raid_details
+
+    def io_status(self) -> str:
+        return "\n\n".join(self.io_log) if self.io_log else "Nenhuma E/S executada nesta sessão."
+
+    def fail_raid_disk(self, disk_number: int) -> str:
+        try:
+            return "\n".join(self.raid.fail_and_rebuild(disk_number))
+        except ValueError as exc:
+            raise FileSystemError(str(exc)) from exc
+
+    def raid_status(self) -> str:
+        return self.raid.status()
 
     def _resolve(self, path: str) -> Node:
         if not path:
@@ -145,7 +197,8 @@ class FileSystem:
         node = self._resolve(path)
         if node.is_dir:
             raise FileSystemError(f"'{node.path()}' é um diretório, não um arquivo.")
-        return f"Arquivo: {node.path()} | Tamanho: {node.size} bytes | Blocos de dados: {node.blocks}"
+        info = f"Arquivo: {node.path()} | Tamanho: {node.size} bytes | Blocos de dados: {node.blocks}"
+        return info + "\n" + self.read_data(path)
 
     def update_file(self, path: str, size: int) -> str:
         if size < 0:
@@ -250,8 +303,13 @@ class FileSystem:
         return """Comandos disponíveis:
   mkdir <caminho>                 cria diretório
   create <caminho> --size <bytes> cria arquivo e aloca espaço
-  read <caminho>                  exibe informações do arquivo
+  read <caminho>                  lê arquivo e gera E/S no disco
+  write_file <caminho> "texto"    grava dados e gera E/S no RAID
+  write_file <caminho> --size 8KB simula gravação por tamanho
   update <caminho> --size <bytes> altera tamanho e realoca o arquivo
+  disk_status                     exibe o histórico de escalonamento de E/S
+  raid_status                     exibe o estado do arranjo RAID
+  fail_disk <número>              simula falha e reconstrução RAID
   rm <caminho>                    remove arquivo ou diretório vazio
   cd <caminho> | pwd              navega / mostra diretório atual
   tree                            exibe a árvore de diretórios
@@ -304,6 +362,15 @@ def execute(fs: FileSystem, line: str) -> tuple[bool, str]:
             return True, f"Arquivo criado: {fs.create_file(args[1], size)} ({size} bytes)."
         if cmd in ("read", "cat", "info") and len(args) == 2:
             return True, fs.read_file(args[1])
+        if cmd == "write_file" and len(args) >= 3:
+            if len(args) == 4 and args[2] == "--size":
+                size = parse_size(args[3])
+                payload = b"\0" * size
+            elif len(args) == 3:
+                payload = args[2].encode("utf-8")
+            else:
+                raise FileSystemError('Uso: write_file <caminho> "texto" ou --size <tamanho>')
+            return True, fs.write_data(args[1], payload)
         if cmd == "update" and len(args) == 4 and args[2] == "--size":
             return True, fs.update_file(args[1], parse_size(args[3]))
         if cmd in ("rm", "rmdir", "delete") and len(args) == 2:
@@ -314,6 +381,15 @@ def execute(fs: FileSystem, line: str) -> tuple[bool, str]:
             return True, fs.cwd.path()
         if cmd == "tree" and len(args) == 1:
             return True, "[ÁRVORE DO SISTEMA DE ARQUIVOS]\n" + fs.tree()
+        if cmd == "disk_status" and len(args) == 1:
+            return True, fs.io_status()
+        if cmd == "raid_status" and len(args) == 1:
+            return True, fs.raid_status()
+        if cmd == "fail_disk" and len(args) == 2:
+            try:
+                return True, fs.fail_raid_disk(int(args[1]))
+            except ValueError as exc:
+                raise FileSystemError("O número do disco deve ser inteiro.") from exc
         if cmd == "fs_status" and len(args) in (1, 2) and (len(args) == 1 or args[1] == "--details"):
             return True, fs.status()
         raise FileSystemError("Comando ou argumentos inválidos. Digite 'help' para ver os comandos.")
@@ -326,10 +402,17 @@ def main() -> int:
     parser.add_argument("--block-size", type=int, default=4096, help="tamanho de cada bloco em bytes (padrão: 4096)")
     parser.add_argument("--blocks", type=int, default=16, help="número total de blocos (padrão: 16)")
     parser.add_argument("--strategy", choices=FileSystem.STRATEGIES, default="indexed", help="contiguous, linked ou indexed")
+    parser.add_argument("--scheduler", choices=DiskScheduler.ALGORITHMS, default="SSTF",
+                        help="FCFS, SSTF, SCAN ou C-SCAN (padrão: SSTF)")
+    parser.add_argument("--tracks", type=int, default=200, help="quantidade de trilhas do disco")
+    parser.add_argument("--head", type=int, default=53, help="posição inicial da cabeça")
+    parser.add_argument("--raid", choices=RAIDArray.LEVELS, default="5", help="nível RAID: 0, 1, 4 ou 5")
+    parser.add_argument("--raid-disks", type=int, default=3, help="quantidade de discos no arranjo RAID")
     parser.add_argument("--command", help="executa um comando e encerra (útil para demonstração)")
     args = parser.parse_args()
     try:
-        fs = FileSystem(args.block_size, args.blocks, args.strategy)
+        fs = FileSystem(args.block_size, args.blocks, args.strategy,
+                        args.scheduler, args.tracks, args.head, args.raid, args.raid_disks)
     except ValueError as exc:
         parser.error(str(exc))
     if args.command:
