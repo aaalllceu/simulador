@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import shlex
 import sys
 from dataclasses import dataclass, field
+from getpass import getpass
 from typing import Optional
 
 from disk_io import DiskScheduler, IORequest, RAIDArray
+from security import (IdentityManager, SecurityError, allowed, decrypt_bytes,
+                      encrypt_bytes, mode_text)
 
 
 @dataclass
@@ -21,6 +25,13 @@ class Node:
     size: int = 0
     blocks: list[int] = field(default_factory=list)
     index_block: Optional[int] = None
+    owner: str = "root"
+    group: str = "admin"
+    mode: int = 0o755
+    content: bytes = b""
+    encrypted: bool = False
+    encryption_salt: Optional[bytes] = None
+    block_hashes: dict[int, str] = field(default_factory=dict)
 
     def path(self) -> str:
         if self.parent is None:
@@ -52,9 +63,174 @@ class FileSystem:
         self.strategy = strategy
         self.scheduler = DiskScheduler(scheduler, disk_tracks, head)
         self.raid = RAIDArray(raid_level, raid_disks, block_size)
-        self.root = Node("", True)
+        self.root = Node("", True, owner="root", group="admin", mode=0o755)
         self.cwd = self.root
         self.io_log: list[str] = []
+        self.identity = IdentityManager()
+        self.audit_log: list[str] = []
+        self.malicious_signatures = (b"EICAR-STANDARD-ANTIVIRUS-TEST-FILE", b"MALWARE_SIMULADO")
+
+    def _require_privileged(self, operation: str) -> None:
+        if not self.identity.is_root:
+            message = f"[NEGADO] Operação '{operation}' exige MODO_KERNEL (root)."
+            self.audit_log.append(f"NEGADO {self.identity.current_user}: {operation}")
+            raise FileSystemError(message)
+
+    def _check_access(self, node: Node, action: str) -> None:
+        user = self.identity.user
+        ok = allowed(node.mode, action, user.name == node.owner,
+                     user.group == node.group, self.identity.is_root)
+        if not ok:
+            message = (f"[NEGADO] O usuário '{user.name}' não possui permissão de "
+                       f"{action} no objeto '{node.path()}'.")
+            self.audit_log.append(f"NEGADO {user.name}: {action} {node.path()}")
+            raise FileSystemError(message)
+
+    def _record_integrity(self, node: Node) -> None:
+        node.block_hashes = {}
+        for index, block in enumerate(node.blocks):
+            start = index * self.block_size
+            chunk = node.content[start:start + self.block_size]
+            node.block_hashes[block] = hashlib.sha256(chunk).hexdigest()
+
+    def add_group(self, name: str) -> str:
+        self._require_privileged("criar grupo")
+        try:
+            return self.identity.add_group(name)
+        except SecurityError as exc:
+            raise FileSystemError(str(exc)) from exc
+
+    def add_user(self, name: str, password: str, group: str) -> str:
+        self._require_privileged("criar usuário")
+        try:
+            self.identity.add_user(name, password, group)
+        except SecurityError as exc:
+            raise FileSystemError(str(exc)) from exc
+        home = self.root.children.get("home")
+        if home is None:
+            home = Node("home", True, self.root, owner="root", group="admin", mode=0o755)
+            self.root.children["home"] = home
+        if name not in home.children:
+            home.children[name] = Node(name, True, home, owner=name, group=group, mode=0o700)
+        return name
+
+    def login(self, name: str, password: str) -> str:
+        try:
+            user = self.identity.authenticate(name, password)
+        except SecurityError as exc:
+            self.audit_log.append(f"FALHA DE LOGIN: {name}")
+            raise FileSystemError(str(exc)) from exc
+        mode = "MODO_KERNEL" if self.identity.is_root else "MODO_USUARIO"
+        return f"Autenticado com sucesso. Usuário: '{user.name}' | Grupo: '{user.group}' | Modo: {mode}"
+
+    def security_status(self) -> str:
+        user = self.identity.user
+        mode = "MODO_KERNEL (root)" if self.identity.is_root else "MODO_USUARIO"
+        return f"Usuário atual: {user.name} | Grupo: {user.group} | Modo: {mode}"
+
+    def set_permissions(self, path: str, mode: int) -> str:
+        self._require_privileged("alterar ACL/permissões")
+        if not 0 <= mode <= 0o777:
+            raise FileSystemError("Permissões devem estar entre 000 e 777.")
+        node = self._resolve(path)
+        node.mode = mode
+        return f"Permissões de '{node.path()}' atualizadas para {mode_text(mode)} ({mode:03o})."
+
+    def acl_status(self, path: str) -> str:
+        node = self._resolve(path)
+        return (f"Objeto      : {node.path()}\nProprietário: {node.owner} (Grupo: {node.group})\n"
+                f"Permissões  : {mode_text(node.mode)} ({node.mode:03o})")
+
+    def encrypt_file(self, path: str, key: str) -> str:
+        self._require_privileged("criptografar arquivo")
+        node = self._resolve(path)
+        if node.is_dir:
+            raise FileSystemError(f"'{node.path()}' é um diretório, não um arquivo.")
+        self._check_access(node, "write")
+        if node.encrypted:
+            raise FileSystemError("O arquivo já está criptografado.")
+        try:
+            ciphertext, salt = encrypt_bytes(node.content, key)
+        except SecurityError as exc:
+            raise FileSystemError(str(exc)) from exc
+        original_content, original_size = node.content, node.size
+        original_blocks, original_index = node.blocks, node.index_block
+        node.content, node.encryption_salt, node.encrypted = ciphertext, salt, True
+        node.size = len(ciphertext)
+        node.blocks, node.index_block = [], None
+        try:
+            node.blocks, node.index_block = self._allocate(node, node.size)
+        except FileSystemError:
+            node.content, node.size = original_content, original_size
+            node.blocks, node.index_block = original_blocks, original_index
+            node.encrypted, node.encryption_salt = False, None
+            raise
+        self._record_integrity(node)
+        io_result = self._schedule_file_io(node, "WRITE")
+        self.raid.write(node.path(), ciphertext)
+        return (f"Arquivo '{node.path()}' criptografado com sucesso.\n"
+                f"Conteúdo gravado nos blocos físicos: [CIPHERTEXT: {ciphertext[:24].hex()}...]\n{io_result}")
+
+    def _allocate_for_replacement(self, node: Node, size: int) -> tuple[list[int], Optional[int]]:
+        previous_blocks, previous_index = node.blocks, node.index_block
+        node.blocks, node.index_block = [], None
+        try:
+            blocks, index = self._allocate(node, size)
+            return blocks, index
+        finally:
+            node.blocks, node.index_block = previous_blocks, previous_index
+
+    def antivirus_scan(self, path: str = "/") -> str:
+        self._require_privileged("varredura de segurança")
+        root = self._resolve(path)
+        if not root.is_dir:
+            raise FileSystemError("A varredura deve começar em um diretório.")
+        files: list[Node] = []
+        def collect(node: Node) -> None:
+            for child in node.children.values():
+                if child.is_dir:
+                    collect(child)
+                else:
+                    files.append(child)
+        collect(root)
+        lines = ["[MÓDULO DE SEGURANÇA - VARREDURA DE INTEGRIDADE]",
+                 f"Analisando {len(files)} arquivo(s) em busca de assinaturas maliciosas e hashes corrompidos..."]
+        for node in files:
+            mismatched = []
+            for index, block in enumerate(node.blocks):
+                start = index * self.block_size
+                chunk = node.content[start:start + self.block_size]
+                current = hashlib.sha256(chunk).hexdigest()
+                if node.block_hashes.get(block) != current:
+                    mismatched.append(block)
+            suspicious = any(signature in node.content for signature in self.malicious_signatures)
+            if mismatched:
+                result = f"[ALERTA] Hash do(s) bloco(s) {mismatched} difere do registro oficial! Possível modificação direta não autorizada."
+                self.audit_log.append(f"INTEGRIDADE: {node.path()} blocos {mismatched}")
+            elif suspicious:
+                result = "[ALERTA] Assinatura maliciosa simulada identificada!"
+                self.audit_log.append(f"ASSINATURA: {node.path()}")
+            elif node.encrypted:
+                result = "[OK - Criptografado e íntegro]"
+            else:
+                result = "[OK - íntegro]"
+            lines.append(f"- {node.path():<28}: {result}")
+        if not files:
+            lines.append("Nenhum arquivo encontrado.")
+        return "\n".join(lines)
+
+    def tamper_block(self, path: str, block_number: int) -> str:
+        self._require_privileged("simular adulteração de bloco")
+        node = self._resolve(path)
+        if node.is_dir or block_number not in node.blocks:
+            raise FileSystemError("O bloco indicado não pertence a esse arquivo.")
+        offset = node.blocks.index(block_number) * self.block_size
+        if not node.content:
+            raise FileSystemError("O arquivo não contém dados para adulterar.")
+        changed = bytearray(node.content)
+        changed[min(offset, len(changed) - 1)] ^= 1
+        node.content = bytes(changed)
+        return f"Bloco {block_number} de '{node.path()}' adulterado para teste de auditoria."
 
     def _schedule_file_io(self, node: Node, operation: str) -> str:
         requests = [IORequest(track=block % self.scheduler.tracks,
@@ -73,10 +249,15 @@ class FileSystem:
         node = self._resolve(path)
         if node.is_dir:
             raise FileSystemError(f"'{node.path()}' é um diretório, não um arquivo.")
+        self._check_access(node, "write")
+        if node.encrypted:
+            raise FileSystemError("Arquivo criptografado: descriptografe-o explicitamente antes de gravar novos dados.")
         required_size = max(node.size, len(data))
         if required_size > node.size:
             self.update_file(path, required_size)
             node = self._resolve(path)
+        node.content = data
+        self._record_integrity(node)
         result = self._schedule_file_io(node, "WRITE")
         raid_lines = self.raid.write(node.path(), data)
         return result + "\n\n" + "\n".join(raid_lines)
@@ -85,14 +266,29 @@ class FileSystem:
         node = self._resolve(path)
         if node.is_dir:
             raise FileSystemError(f"'{node.path()}' é um diretório, não um arquivo.")
+        self._check_access(node, "read")
         result = self._schedule_file_io(node, "READ")
         raid_details = self.raid.status()
-        return result + "\n\n[LEITURA RAID]\n" + raid_details
+        content_line = (f"Conteúdo protegido: ciphertext ({len(node.content)} bytes)" if node.encrypted
+                        else f"Conteúdo: {node.content.decode('utf-8', errors='replace')}")
+        return result + "\n" + content_line + "\n\n[LEITURA RAID]\n" + raid_details
+
+    def decrypt_file(self, path: str, key: str) -> str:
+        node = self._resolve(path)
+        if node.is_dir or not node.encrypted or node.encryption_salt is None:
+            raise FileSystemError("O arquivo indicado não está criptografado.")
+        self._check_access(node, "read")
+        try:
+            plaintext = decrypt_bytes(node.content, key, node.encryption_salt)
+        except SecurityError as exc:
+            raise FileSystemError(str(exc)) from exc
+        return f"Conteúdo descriptografado de '{node.path()}': {plaintext.decode('utf-8', errors='replace')}"
 
     def io_status(self) -> str:
         return "\n\n".join(self.io_log) if self.io_log else "Nenhuma E/S executada nesta sessão."
 
     def fail_raid_disk(self, disk_number: int) -> str:
+        self._require_privileged("simular falha de disco RAID")
         try:
             return "\n".join(self.raid.fail_and_rebuild(disk_number))
         except ValueError as exc:
@@ -114,6 +310,7 @@ class FileSystem:
                 continue
             if not current.is_dir:
                 raise FileSystemError(f"'{current.path()}' não é um diretório.")
+            self._check_access(current, "execute")
             if part not in current.children:
                 raise FileSystemError(f"Caminho não encontrado: '{path}'.")
             current = current.children[part]
@@ -177,27 +374,38 @@ class FileSystem:
 
     def mkdir(self, path: str) -> str:
         parent, name = self._parent_and_name(path)
+        self._check_access(parent, "write")
+        self._check_access(parent, "execute")
         if name in parent.children:
             raise FileSystemError(f"Já existe um item chamado '{name}'.")
-        parent.children[name] = Node(name, True, parent)
+        user = self.identity.user
+        parent.children[name] = Node(name, True, parent, owner=user.name,
+                                     group=user.group, mode=0o755)
         return parent.children[name].path()
 
     def create_file(self, path: str, size: int = 0) -> str:
         if size < 0:
             raise FileSystemError("O tamanho não pode ser negativo.")
         parent, name = self._parent_and_name(path)
+        self._check_access(parent, "write")
+        self._check_access(parent, "execute")
         if name in parent.children:
             raise FileSystemError(f"Já existe um item chamado '{name}'.")
-        node = Node(name, False, parent, size=size)
+        user = self.identity.user
+        node = Node(name, False, parent, size=size, owner=user.name,
+                    group=user.group, mode=0o644)
         node.blocks, node.index_block = self._allocate(node, size)
         parent.children[name] = node
+        self._record_integrity(node)
         return node.path()
 
     def read_file(self, path: str) -> str:
         node = self._resolve(path)
         if node.is_dir:
             raise FileSystemError(f"'{node.path()}' é um diretório, não um arquivo.")
-        info = f"Arquivo: {node.path()} | Tamanho: {node.size} bytes | Blocos de dados: {node.blocks}"
+        self._check_access(node, "read")
+        info = (f"Arquivo: {node.path()} | Tamanho: {node.size} bytes | Blocos de dados: {node.blocks} | "
+                f"Proprietário: {node.owner} (Grupo: {node.group}) | ACL: {mode_text(node.mode)} ({node.mode:03o})")
         return info + "\n" + self.read_data(path)
 
     def update_file(self, path: str, size: int) -> str:
@@ -206,6 +414,9 @@ class FileSystem:
         node = self._resolve(path)
         if node.is_dir:
             raise FileSystemError(f"'{node.path()}' é um diretório, não um arquivo.")
+        self._check_access(node, "write")
+        if node.encrypted:
+            raise FileSystemError("Descriptografe o arquivo antes de redimensioná-lo.")
         old_blocks, old_index, old_size = node.blocks, node.index_block, node.size
         node.blocks, node.index_block = [], None
         try:
@@ -214,12 +425,16 @@ class FileSystem:
             node.blocks, node.index_block, node.size = old_blocks, old_index, old_size
             raise
         node.size = size
+        node.content = node.content[:size].ljust(size, b"\0")
+        self._record_integrity(node)
         return f"Arquivo atualizado: {node.path()} ({size} bytes)."
 
     def delete(self, path: str) -> str:
         node = self._resolve(path)
         if node.parent is None:
             raise FileSystemError("A raiz não pode ser removida.")
+        self._check_access(node.parent, "write")
+        self._check_access(node.parent, "execute")
         if node.is_dir and node.children:
             raise FileSystemError("Diretório não vazio. Remova seu conteúdo primeiro.")
         del node.parent.children[node.name]
@@ -301,6 +516,18 @@ class FileSystem:
 
     def help_text(self) -> str:
         return """Comandos disponíveis:
+  login --user <nome>             autentica usuário (senha solicitada)
+  logout                          volta ao modo kernel/root
+  whoami                          exibe usuário, grupo e modo
+  groupadd <grupo>                [root] cria grupo
+  useradd <usuário> <grupo>       [root] cadastra usuário (senha solicitada)
+  chmod <modo octal> <caminho>    [root] altera ACL, ex.: chmod 750 /arquivo
+  acl <caminho>                   exibe proprietário e permissões rwx
+  encrypt_file <caminho>          criptografa em repouso (chave solicitada)
+  decrypt_file <caminho>          descriptografa para leitura (chave solicitada)
+  antivirus_scan [diretório]      verifica integridade e assinaturas simuladas
+  tamper_block <caminho> <bloco>  [root] adultera bloco para demonstrar auditoria
+  audit_log                       exibe tentativas e alertas registrados
   mkdir <caminho>                 cria diretório
   create <caminho> --size <bytes> cria arquivo e aloca espaço
   read <caminho>                  lê arquivo e gera E/S no disco
@@ -351,6 +578,49 @@ def execute(fs: FileSystem, line: str) -> tuple[bool, str]:
             return False, "Encerrando simulador."
         if cmd == "help":
             return True, fs.help_text()
+        if cmd == "logout" and len(args) == 1:
+            fs.identity.logout()
+            return True, fs.security_status()
+        if cmd == "su" and len(args) == 1:
+            if not fs.identity.is_root:
+                raise FileSystemError("A troca para root exige autenticação explícita de root.")
+            return True, fs.security_status()
+        if cmd == "whoami" and len(args) == 1:
+            return True, fs.security_status()
+        if cmd == "login" and len(args) == 3 and args[1] == "--user":
+            password = getpass("Senha: ")
+            return True, fs.login(args[2], password)
+        if cmd == "login" and len(args) == 4 and args[1] == "--user" and args[3] == "--password":
+            raise FileSystemError("Por segurança, não informe senha na linha de comando; use login --user <nome>.")
+        if cmd == "groupadd" and len(args) == 2:
+            return True, f"Grupo criado: {fs.add_group(args[1])}"
+        if cmd == "useradd" and len(args) == 3:
+            password = getpass(f"Senha para {args[1]}: ")
+            return True, f"Usuário criado: {fs.add_user(args[1], password, args[2])}"
+        if cmd == "chmod" and len(args) == 3:
+            try:
+                mode = int(args[1], 8)
+            except ValueError as exc:
+                raise FileSystemError("Modo inválido; use octal como 750.") from exc
+            return True, fs.set_permissions(args[2], mode)
+        if cmd == "acl" and len(args) == 2:
+            return True, fs.acl_status(args[1])
+        if cmd == "encrypt_file" and len(args) == 2:
+            key = getpass("Chave de criptografia: ")
+            return True, fs.encrypt_file(args[1], key)
+        if cmd == "decrypt_file" and len(args) == 2:
+            key = getpass("Chave de criptografia: ")
+            return True, fs.decrypt_file(args[1], key)
+        if cmd == "antivirus_scan" and len(args) in (1, 2):
+            return True, fs.antivirus_scan(args[1] if len(args) == 2 else "/")
+        if cmd == "tamper_block" and len(args) == 3:
+            try:
+                block = int(args[2])
+            except ValueError as exc:
+                raise FileSystemError("Número do bloco inválido.") from exc
+            return True, fs.tamper_block(args[1], block)
+        if cmd == "audit_log" and len(args) == 1:
+            return True, "\n".join(fs.audit_log) if fs.audit_log else "Nenhum evento de segurança registrado."
         if cmd == "mkdir" and len(args) == 2:
             return True, f"Diretório criado: {fs.mkdir(args[1])}"
         if cmd in ("create", "touch") and len(args) in (2, 4):
@@ -373,6 +643,8 @@ def execute(fs: FileSystem, line: str) -> tuple[bool, str]:
             return True, fs.write_data(args[1], payload)
         if cmd == "update" and len(args) == 4 and args[2] == "--size":
             return True, fs.update_file(args[1], parse_size(args[3]))
+        if cmd == "read_file" and len(args) == 2:
+            return True, fs.read_file(args[1])
         if cmd in ("rm", "rmdir", "delete") and len(args) == 2:
             return True, fs.delete(args[1])
         if cmd == "cd" and len(args) == 2:
