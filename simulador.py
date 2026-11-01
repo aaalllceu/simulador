@@ -12,6 +12,7 @@ from getpass import getpass
 from typing import Optional
 
 from disk_io import DiskScheduler, IORequest, RAIDArray
+from memoria import MemoryErrorSim, MemoryManager
 from security import (IdentityManager, SecurityError, allowed, decrypt_bytes,
                       encrypt_bytes, mode_text)
 
@@ -53,7 +54,11 @@ class FileSystem:
     def __init__(self, block_size: int = 4096, total_blocks: int = 16,
                  strategy: str = "indexed", scheduler: str = "SSTF",
                  disk_tracks: int = 200, head: int = 53,
-                 raid_level: str = "5", raid_disks: int = 3):
+                 raid_level: str = "5", raid_disks: int = 3,
+                 reserved_memory: int = 4 * 1024 * 1024,
+                 kernel_memory: int = 1024 * 1024,
+                 page_size: int = 4096, frames: int = 8,
+                 page_algorithm: str = "LRU"):
         if block_size <= 0 or total_blocks <= 0:
             raise ValueError("O tamanho do bloco e a quantidade de blocos devem ser positivos.")
         if strategy not in self.STRATEGIES:
@@ -69,6 +74,11 @@ class FileSystem:
         self.identity = IdentityManager()
         self.audit_log: list[str] = []
         self.malicious_signatures = (b"EICAR-STANDARD-ANTIVIRUS-TEST-FILE", b"MALWARE_SIMULADO")
+        try:
+            self.memory = MemoryManager(reserved_memory, kernel_memory,
+                                       page_size, frames, page_algorithm)
+        except ValueError as exc:
+            raise ValueError(f"Configuração de memória inválida: {exc}") from exc
 
     def _require_privileged(self, operation: str) -> None:
         if not self.identity.is_root:
@@ -296,6 +306,40 @@ class FileSystem:
 
     def raid_status(self) -> str:
         return self.raid.status()
+
+    def create_process(self, name: str, size: int, kind: str) -> str:
+        try:
+            return self.memory.create_process(name, size, kind)
+        except MemoryErrorSim as exc:
+            raise FileSystemError(str(exc)) from exc
+
+    def terminate_process(self, name: str) -> str:
+        try:
+            return self.memory.terminate_process(name)
+        except MemoryErrorSim as exc:
+            raise FileSystemError(str(exc)) from exc
+
+    def translate_address(self, name: str, page: int) -> str:
+        try:
+            return self.memory.translate(name, page)
+        except MemoryErrorSim as exc:
+            raise FileSystemError(str(exc)) from exc
+
+    def execute_memory_step(self, name: str, instruction: str) -> str:
+        try:
+            return self.memory.execute_step(name, instruction)
+        except MemoryErrorSim as exc:
+            raise FileSystemError(str(exc)) from exc
+
+    def compact_memory(self) -> str:
+        return self.memory.compact_reserved()
+
+    def memory_status(self, area: str = "all") -> str:
+        if area == "reserved":
+            return self.memory.status_reserved()
+        if area in ("virtual", "dynamic"):
+            return self.memory.status_virtual()
+        return self.memory.status()
 
     def _resolve(self, path: str) -> Node:
         if not path:
@@ -528,6 +572,12 @@ class FileSystem:
   antivirus_scan [diretório]      verifica integridade e assinaturas simuladas
   tamper_block <caminho> <bloco>  [root] adultera bloco para demonstrar auditoria
   audit_log                       exibe tentativas e alertas registrados
+  create_process --name <nome> --size <tamanho> --type critical|normal
+  terminate_process --name <nome> encerra processo e libera memória
+  translate_address --process <nome> --page <n> traduz página lógica
+  execute_step --process <nome> --instruction "LOAD_DATA Página 2"
+  memory_status [--reserved|--virtual] exibe mapa e ocupação da RAM
+  memory_compact --reserved       compacta a região crítica contígua
   mkdir <caminho>                 cria diretório
   create <caminho> --size <bytes> cria arquivo e aloca espaço
   read <caminho>                  lê arquivo e gera E/S no disco
@@ -621,6 +671,30 @@ def execute(fs: FileSystem, line: str) -> tuple[bool, str]:
             return True, fs.tamper_block(args[1], block)
         if cmd == "audit_log" and len(args) == 1:
             return True, "\n".join(fs.audit_log) if fs.audit_log else "Nenhum evento de segurança registrado."
+        if cmd == "create_process":
+            if len(args) != 7 or args[1] != "--name" or args[3] != "--size" or args[5] != "--type":
+                raise FileSystemError("Uso: create_process --name <nome> --size <tamanho> --type critical|normal")
+            return True, fs.create_process(args[2], parse_size(args[4]), args[6])
+        if cmd == "terminate_process":
+            if len(args) != 3 or args[1] != "--name":
+                raise FileSystemError("Uso: terminate_process --name <nome>")
+            return True, fs.terminate_process(args[2])
+        if cmd == "translate_address":
+            if len(args) != 5 or args[1] != "--process" or args[3] != "--page":
+                raise FileSystemError("Uso: translate_address --process <nome> --page <n>")
+            return True, fs.translate_address(args[2], int(args[4]))
+        if cmd == "execute_step":
+            if len(args) != 5 or args[1] != "--process" or args[3] != "--instruction":
+                raise FileSystemError('Uso: execute_step --process <nome> --instruction "LOAD_DATA Página 2"')
+            return True, fs.execute_memory_step(args[2], args[4])
+        if cmd == "memory_status":
+            if len(args) == 1:
+                return True, fs.memory_status()
+            if len(args) == 2 and args[1] in ("--reserved", "--virtual"):
+                return True, fs.memory_status(args[1][2:])
+            raise FileSystemError("Uso: memory_status [--reserved|--virtual]")
+        if cmd == "memory_compact" and args == ["memory_compact", "--reserved"]:
+            return True, fs.compact_memory()
         if cmd == "mkdir" and len(args) == 2:
             return True, f"Diretório criado: {fs.mkdir(args[1])}"
         if cmd in ("create", "touch") and len(args) in (2, 4):
@@ -680,11 +754,18 @@ def main() -> int:
     parser.add_argument("--head", type=int, default=53, help="posição inicial da cabeça")
     parser.add_argument("--raid", choices=RAIDArray.LEVELS, default="5", help="nível RAID: 0, 1, 4 ou 5")
     parser.add_argument("--raid-disks", type=int, default=3, help="quantidade de discos no arranjo RAID")
+    parser.add_argument("--reserved-memory", type=parse_size, default=4 * 1024 * 1024, help="tamanho da região reservada (ex.: 4MB)")
+    parser.add_argument("--kernel-memory", type=parse_size, default=1 * 1024 * 1024, help="tamanho do núcleo base (ex.: 1MB)")
+    parser.add_argument("--page-size", type=parse_size, default=4096, help="tamanho de página (ex.: 4KB)")
+    parser.add_argument("--frames", type=int, default=8, help="molduras físicas dinâmicas")
+    parser.add_argument("--page-algorithm", choices=("LRU", "SECOND_CHANCE"), default="LRU", help="algoritmo de substituição de páginas")
     parser.add_argument("--command", help="executa um comando e encerra (útil para demonstração)")
     args = parser.parse_args()
     try:
         fs = FileSystem(args.block_size, args.blocks, args.strategy,
-                        args.scheduler, args.tracks, args.head, args.raid, args.raid_disks)
+                        args.scheduler, args.tracks, args.head, args.raid, args.raid_disks,
+                        args.reserved_memory, args.kernel_memory, args.page_size,
+                        args.frames, args.page_algorithm)
     except ValueError as exc:
         parser.error(str(exc))
     if args.command:
