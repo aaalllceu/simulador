@@ -13,6 +13,7 @@ from typing import Optional
 
 from disk_io import DiskScheduler, IORequest, RAIDArray
 from memoria import MemoryErrorSim, MemoryManager
+from process_scheduler import ProcessScheduler, SchedulerError
 from security import (IdentityManager, SecurityError, allowed, decrypt_bytes,
                       encrypt_bytes, mode_text)
 
@@ -79,6 +80,7 @@ class FileSystem:
                                        page_size, frames, page_algorithm)
         except ValueError as exc:
             raise ValueError(f"Configuração de memória inválida: {exc}") from exc
+        self.process_scheduler = ProcessScheduler(self.memory, self.scheduler)
 
     def _require_privileged(self, operation: str) -> None:
         if not self.identity.is_root:
@@ -314,10 +316,37 @@ class FileSystem:
             raise FileSystemError(str(exc)) from exc
 
     def terminate_process(self, name: str) -> str:
+        if name in self.process_scheduler.processes:
+            proc = self.process_scheduler.processes[name]
+            if proc.state not in ("NOVO", "PRONTO", "CONCLUÍDO"):
+                raise FileSystemError("Encerre processos em execução ou bloqueados somente ao fim da simulação.")
+            del self.process_scheduler.processes[name]
         try:
             return self.memory.terminate_process(name)
         except MemoryErrorSim as exc:
             raise FileSystemError(str(exc)) from exc
+
+    def create_scheduled_process(self, name: str, burst_ms: int, priority: int,
+                                 kind: str, syscall: str = "", mutex: str = "",
+                                 thread: str = "T1") -> str:
+        try:
+            return self.process_scheduler.create_process(name, burst_ms, priority,
+                                                         kind, syscall, mutex, thread)
+        except (SchedulerError, MemoryErrorSim) as exc:
+            raise FileSystemError(str(exc)) from exc
+
+    def run_processes(self, quantum_ms: int = 2, process_name: Optional[str] = None,
+                      max_steps: Optional[int] = None) -> str:
+        try:
+            result = self.process_scheduler.run(quantum_ms, process_name, max_steps)
+            if result and "[E/S] Requisições pendentes" in result:
+                self.io_log.append(result)
+            return result
+        except SchedulerError as exc:
+            raise FileSystemError(str(exc)) from exc
+
+    def process_status(self) -> str:
+        return self.process_scheduler.status()
 
     def translate_address(self, name: str, page: int) -> str:
         try:
@@ -572,7 +601,11 @@ class FileSystem:
   antivirus_scan [diretório]      verifica integridade e assinaturas simuladas
   tamper_block <caminho> <bloco>  [root] adultera bloco para demonstrar auditoria
   audit_log                       exibe tentativas e alertas registrados
-  create_process --name <nome> --size <tamanho> --type critical|normal
+  create_process --name X --burst 8ms --priority 1 --type normal [--syscall "read_disk at 3ms (duration: 4ms)"] [--mutex "Buffer at 2ms (duration: 3ms)"]
+  create_process --name X --size 512KB --type critical (alocação de memória legada)
+  process_status                  exibe estado e burst dos processos
+  schedule --algorithm Priority_RR --quantum 2ms [--process X] inicia o escalonador
+  run_simulation [--process X] --steps 3 [--quantum 2ms] executa ciclo limitado
   terminate_process --name <nome> encerra processo e libera memória
   translate_address --process <nome> --page <n> traduz página lógica
   execute_step --process <nome> --instruction "LOAD_DATA Página 2"
@@ -613,6 +646,22 @@ def parse_size(value: str) -> int:
     if number < 0 or not number.is_integer():
         raise FileSystemError("O tamanho deve ser um número inteiro não negativo.")
     return int(number * multiplier)
+
+
+def parse_duration(value: str) -> int:
+    """Converte duração em milissegundos sem confundi-la com tamanhos em bytes."""
+    text = value.strip().lower()
+    if text.endswith("ms"):
+        text = text[:-2]
+    elif text.endswith("m"):
+        text = text[:-1]
+    try:
+        number = int(text)
+    except ValueError as exc:
+        raise FileSystemError(f"Duração inválida: '{value}'. Informe milissegundos inteiros, como 8ms.") from exc
+    if number <= 0:
+        raise FileSystemError("A duração deve ser um inteiro positivo em milissegundos.")
+    return number
 
 
 def execute(fs: FileSystem, line: str) -> tuple[bool, str]:
@@ -672,9 +721,61 @@ def execute(fs: FileSystem, line: str) -> tuple[bool, str]:
         if cmd == "audit_log" and len(args) == 1:
             return True, "\n".join(fs.audit_log) if fs.audit_log else "Nenhum evento de segurança registrado."
         if cmd == "create_process":
-            if len(args) != 7 or args[1] != "--name" or args[3] != "--size" or args[5] != "--type":
-                raise FileSystemError("Uso: create_process --name <nome> --size <tamanho> --type critical|normal")
-            return True, fs.create_process(args[2], parse_size(args[4]), args[6])
+            if len(args) >= 2 and args[1] == "--name":
+                options = args[1:]
+                values: dict[str, str] = {}
+                index = 0
+                while index < len(options):
+                    key = options[index]
+                    if key not in ("--name", "--burst", "--priority", "--type", "--syscall", "--mutex", "--thread", "--size"):
+                        raise FileSystemError(f"Opção desconhecida para create_process: {key}")
+                    if index + 1 >= len(options) or options[index + 1].startswith("--"):
+                        raise FileSystemError(f"Informe um valor para {key}.")
+                    values[key] = options[index + 1]
+                    index += 2
+                if "--burst" in values:
+                    if "--size" in values or not {"--name", "--priority", "--type"}.issubset(values):
+                        raise FileSystemError("Uso: create_process --name X --burst 8ms --priority 1 --type normal [--syscall PERFIL] [--mutex EVENTO]")
+                    burst = parse_duration(values["--burst"])
+                    try:
+                        priority = int(values["--priority"])
+                    except ValueError as exc:
+                        raise FileSystemError("Prioridade deve ser um inteiro positivo.") from exc
+                    return True, fs.create_scheduled_process(values["--name"], burst, priority,
+                        values["--type"], values.get("--syscall", ""),
+                        values.get("--mutex", ""), values.get("--thread", "T1"))
+                if {"--name", "--size", "--type"}.issubset(values) and "--priority" not in values:
+                    return True, fs.create_process(values["--name"], parse_size(values["--size"]), values["--type"])
+                raise FileSystemError("Uso: create_process --name X --burst 8ms --priority 1 --type normal ou --name X --size 512KB --type critical")
+            raise FileSystemError("Uso: create_process --name <nome> --burst <ms> --priority <n> --type critical|normal")
+        if cmd in ("schedule", "run_simulation"):
+            quantum = 2
+            process_name = None
+            steps = None
+            index = 1
+            while index < len(args):
+                option = args[index]
+                if option in ("--algorithm", "--quantum", "--process", "--steps"):
+                    if index + 1 >= len(args):
+                        raise FileSystemError(f"Informe um valor para {option}.")
+                    value = args[index + 1]
+                    if option == "--algorithm" and value.lower().replace("-", "_") not in ("priority_rr", "priority+rr"):
+                        raise FileSystemError("O escalonador combinado disponível é Priority_RR.")
+                    if option == "--quantum":
+                        quantum = parse_duration(value)
+                    elif option == "--process":
+                        process_name = value
+                    elif option == "--steps":
+                        try:
+                            steps = int(value)
+                        except ValueError as exc:
+                            raise FileSystemError("--steps deve ser um número inteiro positivo.") from exc
+                    index += 2
+                else:
+                    raise FileSystemError(f"Opção desconhecida: {option}")
+            return True, fs.run_processes(quantum, process_name, steps)
+        if cmd == "process_status" and len(args) == 1:
+            return True, fs.process_status()
         if cmd == "terminate_process":
             if len(args) != 3 or args[1] != "--name":
                 raise FileSystemError("Uso: terminate_process --name <nome>")

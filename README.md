@@ -1,6 +1,6 @@
 # Simulador de Sistema de Arquivos, E/S e RAID
 
-Projeto didático em Python que integra árvore de diretórios e arquivos, operações CRUD, alocação física, geração e escalonamento de requisições de E/S, arranjos RAID, controles de segurança (usuários, grupos, ACL, criptografia e auditoria) e gerenciamento híbrido de memória. A etapa de memória separa região crítica reservada com alocação contígua de RAM dinâmica paginada sob demanda, tradução de endereços, page faults e substituição LRU ou Segunda Chance. Os dados do sistema simulado ficam em memória; nenhuma operação grava no disco físico do computador. A criptografia usa a biblioteca `cryptography` (Fernet com chave derivada por PBKDF2-HMAC-SHA256).
+Projeto didático em Python que integra árvore de diretórios e arquivos, operações CRUD, alocação física, geração e escalonamento de requisições de E/S, arranjos RAID, controles de segurança (usuários, grupos, ACL, criptografia e auditoria), memória híbrida paginada e escalonamento de processos. A etapa de processos oferece ciclo de vida, prioridade + Round-Robin, perfil de syscalls/E/S, bloqueio por mutex, referências de página dinâmicas e métricas WT/TAT, trocas de contexto e utilização de CPU. Os dados do sistema simulado ficam em memória; nenhuma operação grava no disco físico do computador. A criptografia usa a biblioteca `cryptography` (Fernet com chave derivada por PBKDF2-HMAC-SHA256).
 
 ## Requisitos e execução
 
@@ -62,8 +62,13 @@ Movimento: 208 trilhas
 | `antivirus_scan [diretório]` | [root] Verifica hashes de blocos e assinaturas de teste |
 | `tamper_block <caminho> <bloco>` | [root] Adultera dados para demonstração de auditoria |
 | `audit_log` | Lista eventos e acessos negados desta sessão |
-| `create_process --name X --size 10KB --type critical\|normal` | Aloca na região contígua ou cria processo paginado |
-| `terminate_process --name X` | Finaliza processo e libera memória |
+| `create_process --name X --burst 8ms --priority 1 --type normal [--syscall "read_disk at 3ms (duration: 4ms)"]` | Cadastra processo pronto, com perfil de E/S; `--syscall random` gera evento reproduzível |
+| `create_process --name X --burst 8ms --priority 1 --type normal --mutex "Buffer at 2ms (duration: 3ms)" --thread T1` | Agenda disputa de mutex durante o burst |
+| `schedule --algorithm Priority_RR --quantum 2ms` | Executa fila multinível por prioridade, com Round-Robin dentro de cada nível |
+| `run_simulation --process X --steps 3 --quantum 2ms` | Avança até três ms de CPU e mantém os processos para continuar depois |
+| `process_status` | Lista PID, burst, tempo restante e estado do ciclo de vida |
+| `create_process --name X --size 512KB --type critical\|normal` | Compatibilidade com a interface de alocação de memória da etapa anterior |
+| `terminate_process --name X` | Finaliza processo não executando e libera memória |
 | `translate_address --process X --page 1` | Traduz página para moldura; indica HIT ou page fault |
 | `execute_step --process X --instruction "LOAD_DATA Página 2"` | Executa referência de memória e pode gerar page fault |
 | `memory_status [--reserved\|--virtual]` | Mostra mapa e ocupação das regiões de RAM |
@@ -71,6 +76,26 @@ Movimento: 208 trilhas
 | `help` / `exit` | Ajuda / encerrar |
 
 Caminhos absolutos e relativos são aceitos. Tamanhos aceitam bytes, `K`, `KB`, `M` e `MB` (base 1024). `read` gera a E/S dos blocos de dados (e bloco de índice quando aplicável); `write_file` escalona os mesmos tipos de requisição e distribui os bytes no arranjo RAID configurado. Senhas são armazenadas como hashes PBKDF2-HMAC-SHA256 com salt aleatório; não são persistidas em texto puro. Arquivos começam com permissões Unix `644`, diretórios com `755` e pastas pessoais com `700`. A varredura detecta alteração depois do registro em memória, mas não é um antivírus real. A criptografia em repouso é simulada nos bytes mantidos na memória; o estado não sobrevive ao encerramento do programa.
+
+### Etapa 5 — processos, E/S, memória e escalonamento
+
+Os processos recebem PID incremental (iniciando em 101), estado inicial `PRONTO`, burst em ms, prioridade positiva e tipo `normal` ou `critical`. Número de prioridade menor indica nível mais alto. Processos normais recebem referências de página pseudoaleatórias determinísticas, enviadas ao mesmo `MemoryManager` LRU/Segunda Chance das etapas anteriores; processos críticos continuam usando a região reservada contígua.
+
+A fila seleciona sempre a prioridade mais alta pronta e faz Round-Robin entre processos do mesmo nível, com quantum configurável. Syscalls ocorrem ao atingir o tempo de CPU indicado: geram uma requisição para o escalonador de disco configurado e bloqueiam o processo pela duração definida; `random` escolhe um instante/duração determinísticos para facilitar a reprodução. Eventos mutex são configurados por processo para demonstrar aquisição, contenção, bloqueio e retomada do primeiro processo à espera. `run_simulation --steps N` limita o tempo de CPU executado e pode ser chamado novamente para continuar.
+
+Exemplo de sessão (entre aspas, pois os perfis contêm espaços):
+
+```text
+create_process --name App_Web --burst 8ms --priority 1 --type normal --syscall "read_disk at 3ms (duration: 4ms)"
+create_process --name App_Render --burst 5ms --priority 2 --type normal --syscall random
+create_process --name App_Mutex --burst 5ms --priority 1 --type normal --mutex "Buffer_Video at 2ms (duration: 3ms)" --thread T1
+process_status
+schedule --algorithm Priority_RR --quantum 2ms
+memory_status --virtual
+disk_status
+```
+
+`WT` mede o tempo em estado pronto (não inclui bloqueio); `TAT` é o intervalo entre chegada e conclusão e inclui espera e bloqueio. As métricas também mostram bloqueio acumulado, trocas de contexto e utilização de CPU na execução. A simulação concorrente de mutex representa disputas de processos/threads no tempo compartilhado, sem threads do sistema operacional reais.
 
 ### Gerenciamento híbrido de memória
 
@@ -145,11 +170,10 @@ PY
 Na pasta do projeto, execute:
 
 ```bash
-python3 -m unittest discover -s tests -v
+PYTHONPATH=. python3 -m unittest discover -s tests -v
 ```
 
-Os testes validam árvore e CRUD, fragmentação, escalonamento, integração de E/S/RAID, credenciais salgadas, privilégios, ACL por proprietário/grupo/outros, criptografia autenticada, adulteração de bloco, detecção de assinatura de teste, memória crítica contígua, compactação, tradução, page faults, LRU e Segunda Chance.
-
+Os testes validam árvore e CRUD, fragmentação, escalonamento de disco, RAID, autenticação/ACL/criptografia/auditoria, memória crítica e paginada, page faults e LRU/Segunda Chance, e os novos cenários de prioridade/RR, perfil de syscalls, integração de E/S de processo, mutex, ciclo de vida e métricas.
 
 
 ## Limitações didáticas
